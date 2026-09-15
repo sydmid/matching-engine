@@ -109,11 +109,94 @@ func (ab *AggregatedBook) ApplySnapshot(snapshot *Snapshot) error {
 // Replay applies a BookLog event to update the aggregated book state.
 // Events with LogType == LogTypeReject do not affect book state but still update the sequence ID.
 // Returns an error if a sequence gap is detected and rebuild fails.
-func (ab *AggregatedBook) Replay(_ *OrderBookLog) error {
-	// TODO: Implement replay logic with:
-	// 1. Gap detection: if log.SequenceID > expected, trigger Rebuild()
-	// 2. Deduplication: skip if log.SequenceID <= current
+func (ab *AggregatedBook) Replay(log *OrderBookLog) error {
+	if log == nil {
+		return errors.New("log is nil")
+	}
+
+	currentSeq := ab.seqID.Load()
+
+	// 2. Deduplication: skip if log.SeqID <= current
+	if log.SeqID <= currentSeq {
+		return nil
+	}
+
+	// 1. Gap detection: if log.SeqID > expected, trigger Rebuild()
+	if log.SeqID > currentSeq+1 {
+		if err := ab.Rebuild(); err != nil {
+			return err
+		}
+		// Check if gap still exists after rebuild
+		if log.SeqID > ab.seqID.Load()+1 {
+			return errors.New("sequence gap still exists after rebuild")
+		}
+		// If rebuild caught us up past this log, deduplicate it
+		if log.SeqID <= ab.seqID.Load() {
+			return nil
+		}
+	}
+
+	// Helper to modify tree
+	updateTree := func(tree *treemap.TreeMap[udecimal.Decimal, udecimal.Decimal], price, sizeDiff udecimal.Decimal, add bool) {
+		currentSize, found := tree.Get(price)
+		if !found {
+			if add {
+				tree.Set(price, sizeDiff)
+			}
+			return
+		}
+
+		var newSize udecimal.Decimal
+		if add {
+			newSize = currentSize.Add(sizeDiff)
+		} else {
+			newSize = currentSize.Sub(sizeDiff)
+		}
+
+		if newSize.IsZero() || newSize.IsNeg() {
+			tree.Del(price)
+		} else {
+			tree.Set(price, newSize)
+		}
+	}
+
+	getTree := func(side Side) *treemap.TreeMap[udecimal.Decimal, udecimal.Decimal] {
+		if side == Buy {
+			return ab.bid
+		}
+		return ab.ask
+	}
+
+	getOppositeTree := func(side Side) *treemap.TreeMap[udecimal.Decimal, udecimal.Decimal] {
+		if side == Buy {
+			return ab.ask
+		}
+		return ab.bid
+	}
+
 	// 3. Apply state change based on LogType
+	switch log.Type {
+	case protocol.LogTypeOpen:
+		tree := getTree(log.Side)
+		updateTree(tree, log.Price, log.Size, true)
+	case protocol.LogTypeCancel:
+		tree := getTree(log.Side)
+		updateTree(tree, log.Price, log.Size, false)
+	case protocol.LogTypeAmend:
+		tree := getTree(log.Side)
+		updateTree(tree, log.OldPrice, log.OldSize, false)
+		updateTree(tree, log.Price, log.Size, true)
+	case protocol.LogTypeMatch:
+		// Taker matches against maker
+		tree := getOppositeTree(log.Side)
+		updateTree(tree, log.Price, log.Size, false)
+	default:
+		// Ignore unknown log types or types that do not affect depth (Reject, User, Admin)
+	}
+
+	// Update sequence ID
+	ab.seqID.Store(log.SeqID)
+
 	return nil
 }
 
